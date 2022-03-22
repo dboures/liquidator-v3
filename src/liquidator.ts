@@ -284,11 +284,11 @@ async function maybeLiquidateAccount(mangoAccount: MangoAccount): Promise<boolea
       return false;
     }
 
-    const equity = mangoAccount.computeValue(mangoGroup, cache).toNumber()
-    if (equity < minEquity && minEquity > 0) {
+    // const equity = mangoAccount.computeValue(mangoGroup, cache).toNumber()
+    // if (equity < minEquity && minEquity > 0) {
       // console.log(`Account ${mangoAccountKeyString} only has ${equity}, PASS`);
-      return false;
-    }
+      // return false;
+    // }
 
 
     const health = mangoAccount.getHealthRatio(mangoGroup, cache, 'Maint');
@@ -378,6 +378,7 @@ async function liquidatableFromLiquidatableFeed() {
   while (true) {
     const account = await candidates.dequeue();
     candidatesSet.delete(account);
+    notify(`account: ${account} is a liquidation candidate at time: ${new Date().toLocaleString()}`)
     await newAccountOnLiquidatableFeed(account);
   }
 }
