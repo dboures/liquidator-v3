@@ -90,9 +90,6 @@ const rpcEndpoint = process.env.ENDPOINT_URL || config.cluster_urls[cluster];
 const connection = new Connection(rpcEndpoint, 'processed' as Commitment);
 const client = new MangoClient(connection, mangoProgramId);
 
-let mangoSubscriptionId = -1;
-let dexSubscriptionId = -1;
-
 let mangoGroup: MangoGroup;
 let cache: MangoCache;
 let liqorMangoAccount: MangoAccount;
@@ -166,117 +163,12 @@ async function main() {
   if (liquidatableFeedWebsocketAddress) {
     await liquidatableFromLiquidatableFeed();
   } else {
-    await liquidatableFromSolanaRpc();
-  }
-}
-
-// never returns
-async function liquidatableFromSolanaRpc() {
-  let mangoAccounts: MangoAccount[] = [];
-  await refreshAccounts(mangoGroup, mangoAccounts);
-  watchAccounts(groupIds.mangoProgramId, mangoGroup, mangoAccounts);
-
-  // eslint-disable-next-line
-  while (true) {
-    try {
-      if (checkTriggers) {
-        // load all the advancedOrders accounts
-        const mangoAccountsWithAOs = mangoAccounts.filter(
-          (ma) => ma.advancedOrdersKey && !ma.advancedOrdersKey.equals(zeroKey),
-        );
-        const allAOs = mangoAccountsWithAOs.map((ma) => ma.advancedOrdersKey);
-
-        const advancedOrders = await getMultipleAccounts(connection, allAOs);
-        [cache, liqorMangoAccount] = await Promise.all([
-          mangoGroup.loadCache(connection),
-          liqorMangoAccount.reload(connection, mangoGroup.dexProgramId),
-        ]);
-
-        mangoAccountsWithAOs.forEach((ma, i) => {
-          const decoded = AdvancedOrdersLayout.decode(
-            advancedOrders[i].accountInfo.data,
-          );
-          ma.advancedOrders = decoded.orders;
-        });
-      } else {
-        [cache, liqorMangoAccount] = await Promise.all([
-          mangoGroup.loadCache(connection),
-          liqorMangoAccount.reload(connection, mangoGroup.dexProgramId),
-        ]);
-      }
-
-      for (const mangoAccount of mangoAccounts) {
-        const mangoAccountKeyString = mangoAccount.publicKey.toBase58();
-
-        // Handle trigger orders for this mango account
-        if (checkTriggers && mangoAccount.advancedOrders) {
-          try {
-            await processTriggerOrders(
-              mangoGroup,
-              cache,
-              perpMarkets,
-              mangoAccount,
-            );
-          } catch (err: any) {
-            if (err.message.includes('MangoErrorCode::InvalidParam')) {
-              console.error(
-                'Failed to execute trigger order, order already executed',
-              );
-            } else if (
-              err.message.includes('MangoErrorCode::TriggerConditionFalse')
-            ) {
-              console.error(
-                'Failed to execute trigger order, trigger condition was false',
-              );
-            } else {
-              console.error(
-                `Failed to execute trigger order for ${mangoAccountKeyString}: ${err}`,
-              );
-            }
-          }
-        }
-
-        // If not liquidatable continue to next mango account
-        if (!mangoAccount.isLiquidatable(mangoGroup, cache)) {
-          continue;
-        }
-
-        // Reload mango account to make sure still liquidatable
-        await mangoAccount.reload(connection, mangoGroup.dexProgramId);
-
-        const liquidated = await maybeLiquidateAccount(mangoAccount);
-        if (liquidated) {
-          await balanceAccount(
-            mangoGroup,
-            liqorMangoAccount,
-            cache,
-            spotMarkets,
-            perpMarkets,
-          );
-        }
-      }
-
-      cache = await mangoGroup.loadCache(connection);
-      await liqorMangoAccount.reload(connection, mangoGroup.dexProgramId);
-
-      // Check need to rebalance again after checking accounts
-      await balanceAccount(
-        mangoGroup,
-        liqorMangoAccount,
-        cache,
-        spotMarkets,
-        perpMarkets,
-      );
-      await sleep(interval);
-    } catch (err) {
-      console.error('Error checking accounts:', err);
-    }
+    return;
   }
 }
 
 async function maybeLiquidateAccount(mangoAccount: MangoAccount): Promise<boolean> {
     const mangoAccountKeyString = mangoAccount.publicKey.toBase58();
-
     if (!mangoAccount.isLiquidatable(mangoGroup, cache)) {
       console.log(
         `Account ${mangoAccountKeyString} no longer liquidatable`,
@@ -284,12 +176,12 @@ async function maybeLiquidateAccount(mangoAccount: MangoAccount): Promise<boolea
       return false;
     }
 
+    // Equity check moved to Rust
     // const equity = mangoAccount.computeValue(mangoGroup, cache).toNumber()
     // if (equity < minEquity && minEquity > 0) {
       // console.log(`Account ${mangoAccountKeyString} only has ${equity}, PASS`);
       // return false;
     // }
-
 
     const health = mangoAccount.getHealthRatio(mangoGroup, cache, 'Maint');
     const accountInfoString = mangoAccount.toPrettyString(
@@ -367,196 +259,37 @@ async function liquidatableFromLiquidatableFeed() {
   ws.on('open', (x) => console.log("opened liquidatable feed"));
   ws.on('error', (status) => console.log("error on liquidatable feed", status));
   ws.on('close', (err) => console.log("closed liquidatable feed", err));
-  ws.on('candidate', (params) => {
-      const account = params.account;
-      if (!candidatesSet.has(account)) {
-        candidatesSet.add(account);
-        candidates.enqueue(account);
-      }
+  ws.on('candidateStart', (params) => {
+    const account = params.account;
+    if (!candidatesSet.has(account)) {
+      console.log(`add: ${account}`)
+      candidatesSet.add(account);
+      candidates.enqueue(account);
+    }
   });
+
+  ws.on('candidate', (params) => {
+    const account = params.account;
+    if (!candidatesSet.has(account)) {
+      console.log(`add: ${account}`)
+      candidatesSet.add(account);
+      candidates.enqueue(account);
+    }
+});
+
+  ws.on('candidateStop', (params) => {
+    const account = params.account;
+    if (candidatesSet.has(account)) {
+      console.log(`remove: ${account}`)
+      candidatesSet.delete(account);
+    }
+});
 
   while (true) {
     const account = await candidates.dequeue();
     candidatesSet.delete(account);
     notify(`account: ${account} is a liquidation candidate at time: ${new Date().toLocaleString()}`)
     await newAccountOnLiquidatableFeed(account);
-  }
-}
-
-function watchAccounts(
-  mangoProgramId: PublicKey,
-  mangoGroup: MangoGroup,
-  mangoAccounts: MangoAccount[],
-) {
-  try {
-    console.log('Watching accounts...');
-    const openOrdersAccountSpan = OpenOrders.getLayout(
-      mangoGroup.dexProgramId,
-    ).span;
-    const openOrdersAccountOwnerOffset = OpenOrders.getLayout(
-      mangoGroup.dexProgramId,
-    ).offsetOf('owner');
-
-    if (mangoSubscriptionId != -1) {
-      connection.removeProgramAccountChangeListener(mangoSubscriptionId);
-    }
-    if (dexSubscriptionId != -1) {
-      connection.removeProgramAccountChangeListener(dexSubscriptionId);
-    }
-
-    mangoSubscriptionId = connection.onProgramAccountChange(
-      mangoProgramId,
-      async ({ accountId, accountInfo }) => {
-        try {
-          const index = mangoAccounts.findIndex((account) =>
-            account.publicKey.equals(accountId),
-          );
-
-          const mangoAccount = new MangoAccount(
-            accountId,
-            MangoAccountLayout.decode(accountInfo.data),
-          );
-          if (index == -1) {
-            mangoAccounts.push(mangoAccount);
-          } else {
-            const spotOpenOrdersAccounts =
-              mangoAccounts[index].spotOpenOrdersAccounts;
-            mangoAccount.spotOpenOrdersAccounts = spotOpenOrdersAccounts;
-            mangoAccounts[index] = mangoAccount;
-            await mangoAccount.loadOpenOrders(
-              connection,
-              mangoGroup.dexProgramId,
-            );
-          }
-        } catch (err) {
-          console.error(`could not update mango account ${err}`);
-        }
-      },
-      'processed',
-      [
-        { dataSize: MangoAccountLayout.span },
-        {
-          memcmp: {
-            offset: MangoAccountLayout.offsetOf('mangoGroup'),
-            bytes: mangoGroup.publicKey.toBase58(),
-          },
-        },
-      ],
-    );
-
-    dexSubscriptionId = connection.onProgramAccountChange(
-      mangoGroup.dexProgramId,
-      ({ accountId, accountInfo }) => {
-        const ownerIndex = mangoAccounts.findIndex((account) =>
-          account.spotOpenOrders.some((key) => key.equals(accountId)),
-        );
-
-        if (ownerIndex > -1) {
-          const openOrdersIndex = mangoAccounts[
-            ownerIndex
-          ].spotOpenOrders.findIndex((key) => key.equals(accountId));
-          const openOrders = OpenOrders.fromAccountInfo(
-            accountId,
-            accountInfo,
-            mangoGroup.dexProgramId,
-          );
-          mangoAccounts[ownerIndex].spotOpenOrdersAccounts[openOrdersIndex] =
-            openOrders;
-        } else {
-          console.error('Could not match OpenOrdersAccount to MangoAccount');
-        }
-      },
-      'processed',
-      [
-        { dataSize: openOrdersAccountSpan },
-        {
-          memcmp: {
-            offset: openOrdersAccountOwnerOffset,
-            bytes: mangoGroup.signerKey.toBase58(),
-          },
-        },
-      ],
-    );
-  } catch (err) {
-    console.error('Error watching accounts', err);
-  } finally {
-    setTimeout(
-      watchAccounts,
-      refreshWebsocketInterval,
-      mangoProgramId,
-      mangoGroup,
-      mangoAccounts,
-    );
-  }
-}
-
-async function refreshAccounts(
-  mangoGroup: MangoGroup,
-  mangoAccounts: MangoAccount[],
-) {
-  try {
-    console.log('Refreshing accounts...');
-    console.time('getAllMangoAccounts');
-
-    mangoAccounts.splice(
-      0,
-      mangoAccounts.length,
-      ...(await client.getAllMangoAccounts(mangoGroup, undefined, true)),
-    );
-    shuffleArray(mangoAccounts);
-
-    console.timeEnd('getAllMangoAccounts');
-    console.log(`Fetched ${mangoAccounts.length} accounts`);
-  } catch (err: any) {
-    console.error(`Error reloading accounts: ${err}`);
-  } finally {
-    setTimeout(
-      refreshAccounts,
-      refreshAccountsInterval,
-      mangoGroup,
-      mangoAccounts,
-    );
-  }
-}
-
-/**
- * Process trigger orders for one mango account
- */
-async function processTriggerOrders(
-  mangoGroup: MangoGroup,
-  cache: MangoCache,
-  perpMarkets: PerpMarket[],
-  mangoAccount: MangoAccount,
-) {
-  for (let i = 0; i < mangoAccount.advancedOrders.length; i++) {
-    const order = mangoAccount.advancedOrders[i];
-    if (!(order.perpTrigger && order.perpTrigger.isActive)) {
-      continue;
-    }
-
-    const trigger = order.perpTrigger;
-    const currentPrice = cache.priceCache[trigger.marketIndex].price;
-    const configMarketIndex = groupIds.perpMarkets.findIndex(
-      (pm) => pm.marketIndex === trigger.marketIndex,
-    );
-    if (
-      (trigger.triggerCondition == 'above' &&
-        currentPrice.gt(trigger.triggerPrice)) ||
-      (trigger.triggerCondition == 'below' &&
-        currentPrice.lt(trigger.triggerPrice))
-    ) {
-      console.log(
-        `Executing order for account ${mangoAccount.publicKey.toBase58()}`,
-      );
-      return client.executePerpTriggerOrder(
-        mangoGroup,
-        mangoAccount,
-        cache,
-        perpMarkets[configMarketIndex],
-        payer,
-        i,
-      );
-    }
   }
 }
 
@@ -1267,12 +1000,6 @@ async function closePositions(
   }
 }
 
-function shuffleArray(array) {
-  for (let i = array.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [array[i], array[j]] = [array[j], array[i]];
-  }
-}
 
 function notify(content: string) {
   if (content && process.env.WEBHOOK_URL) {
